@@ -185,6 +185,41 @@ def is_duel_active(chat_id: int) -> bool:
     )
 
 
+def _get_duel_in_chat(chat_id: int) -> Duel | None:
+    duel_id = _chat_duel.get(chat_id)
+    if not duel_id:
+        return None
+    duel = _duels.get(duel_id)
+    if duel and duel.phase not in ("done", "cancelled"):
+        return duel
+    return None
+
+
+def _duel_aborted(duel: Duel) -> bool:
+    return duel.phase in ("done", "cancelled")
+
+
+async def _cancel_duel(bot: Bot, duel: Duel, canceller_name: str) -> None:
+    async with _lock:
+        if duel.phase in ("done", "cancelled"):
+            return
+        duel.phase = "cancelled"
+        if duel.prep_event:
+            duel.prep_event.set()
+        if duel.jutsu_event:
+            duel.jutsu_event.set()
+        if duel.ban_event:
+            duel.ban_event.set()
+    opponent = duel.opponent_name or "соперник"
+    await _safe_send(
+        bot,
+        duel.chat_id,
+        f"🛑 <b>Duel отменён</b> инициатором <b>{canceller_name}</b>.\n"
+        f"{opponent} свободен. Чат снова открыт.",
+    )
+    await _cleanup_duel(duel)
+
+
 def _player_ids(duel: Duel) -> list[int]:
     return [duel.challenger_id, duel.opponent_id]  # type: ignore[list-item]
 
@@ -206,6 +241,9 @@ async def _wait_prep(duel: Duel) -> None:
         await asyncio.wait_for(duel.prep_event.wait(), timeout=CHOICE_TIMEOUT)
     except asyncio.TimeoutError:
         pass
+    if _duel_aborted(duel):
+        duel.prep_event = None
+        return
     for user_id in _player_ids(duel):
         if _prep_key(user_id, "strategy") not in duel.prep_choices:
             duel.prep_choices[_prep_key(user_id, "strategy")] = random.choice(list(STRATEGIES))
@@ -234,6 +272,9 @@ async def _wait_bans(duel: Duel) -> None:
         await asyncio.wait_for(duel.ban_event.wait(), timeout=BAN_TIMEOUT)
     except asyncio.TimeoutError:
         pass
+    if _duel_aborted(duel):
+        duel.ban_event = None
+        return
     for user_id in _player_ids(duel):
         if user_id not in duel.bans:
             opts = duel.ban_options.get(user_id, [])
@@ -259,6 +300,10 @@ async def _wait_jutsu(duel: Duel, round_num: int) -> None:
         await asyncio.wait_for(duel.jutsu_event.wait(), timeout=CHOICE_TIMEOUT)
     except asyncio.TimeoutError:
         pass
+    if _duel_aborted(duel):
+        duel.jutsu_event = None
+        duel.waiting_jutsu_round = 0
+        return
     for user_id in _player_ids(duel):
         if user_id not in duel.round_jutsu:
             slot = duel.teams[user_id][round_num - 1]
@@ -647,6 +692,8 @@ async def _send_ban_phase(bot: Bot, duel: Duel) -> None:
         )
 
     await ban_task
+    if _duel_aborted(duel):
+        return
     banned = _global_bans(duel)
     ban_lines = ["🔒 <b>Баны зафиксированы:</b>"]
     for user_id, name in (
@@ -670,6 +717,8 @@ async def _send_ban_phase(bot: Bot, duel: Duel) -> None:
 
 
 async def _send_draft_round(bot: Bot, duel: Duel) -> None:
+    if _duel_aborted(duel):
+        return
     role_index = duel.role_index
     role_label = _role_label(role_index)
     banned = _global_bans(duel)
@@ -739,6 +788,8 @@ async def _run_prep(bot: Bot, duel: Duel) -> None:
         )
 
     await prep_task
+    if _duel_aborted(duel):
+        return
 
     lines = ["📋 <b>Подготовка завершена!</b>\n"]
     for user_id, name in (
@@ -762,6 +813,8 @@ async def _run_prep(bot: Bot, duel: Duel) -> None:
 
 async def _finish_draft(bot: Bot, duel: Duel) -> None:
     try:
+        if _duel_aborted(duel):
+            return
         await _safe_send(
             bot,
             duel.chat_id,
@@ -770,6 +823,8 @@ async def _finish_draft(bot: Bot, duel: Duel) -> None:
             f"{random.choice(['🥁', '⚡', '🔥', '🍥'])} {random.choice(ROUND_HYPE)}",
         )
         await asyncio.sleep(PICK_DELAY)
+        if _duel_aborted(duel):
+            return
 
         team1 = duel.teams[duel.challenger_id]
         team2 = duel.teams[duel.opponent_id]
@@ -783,11 +838,16 @@ async def _finish_draft(bot: Bot, duel: Duel) -> None:
             + f"\n\n👀 Это команда соперника для <b>{duel.challenger_name}</b>",
         )
         await asyncio.sleep(PICK_DELAY)
+        if _duel_aborted(duel):
+            return
         await _run_prep(bot, duel)
+        if _duel_aborted(duel):
+            return
         await _run_battle(bot, duel)
     except Exception:
-        duel.phase = "done"
-        await _cleanup_duel(duel)
+        if duel.id in _duels:
+            duel.phase = "done"
+            await _cleanup_duel(duel)
         raise
 
 
@@ -834,6 +894,8 @@ async def _run_battle(bot: Bot, duel: Duel) -> None:
         await asyncio.sleep(BATTLE_DELAY)
 
         for round_num, (slot1, slot2) in enumerate(zip(team1, team2), start=1):
+            if _duel_aborted(duel):
+                return
             for uid in (uid1, uid2):
                 duel.commander_chakra[uid] = min(
                     CHAKRA_MAX,
@@ -933,8 +995,9 @@ async def _run_battle(bot: Bot, duel: Duel) -> None:
         final += h2h_line
         await _safe_send(bot, duel.chat_id, final)
     finally:
-        duel.phase = "done"
-        await _cleanup_duel(duel)
+        if duel.id in _duels:
+            duel.phase = "done"
+            await _cleanup_duel(duel)
 
 
 class DuelBlockMiddleware(BaseMiddleware):
@@ -950,6 +1013,8 @@ class DuelBlockMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         cmd = text.split()[0].split("@")[0].lower()
+        if cmd in ("/otboi",):
+            return await handler(event, data)
         if cmd in DUEL_COMMANDS:
             await event.reply("⏳ Duel уже идёт в этом чате!")
             return
@@ -1020,6 +1085,29 @@ def register_naruto_duel(dp: Dispatcher) -> None:
             reply_markup=_accept_keyboard(duel.id),
         )
         duel.challenge_msg_id = sent.message_id
+
+    @dp.message(Command("otboi"))
+    async def duel_cancel(message: types.Message):
+        if message.chat.type not in ("group", "supergroup"):
+            await message.reply("Duel работает только в группе!")
+            return
+
+        user = message.from_user
+        if not user:
+            return
+
+        duel = _get_duel_in_chat(message.chat.id)
+        if not duel:
+            await message.reply("🍥 В этом чате нет активного duel.")
+            return
+
+        if user.id != duel.challenger_id:
+            await message.reply(
+                "🚫 Отменить duel может только тот, кто вызвал /duel."
+            )
+            return
+
+        await _cancel_duel(message.bot, duel, _user_name(user))
 
     @dp.callback_query(F.data.startswith("dac:"))
     async def duel_accept(callback: types.CallbackQuery):
@@ -1119,6 +1207,8 @@ def register_naruto_duel(dp: Dispatcher) -> None:
             f"<b>{duel.challenger_name}</b> 🆚 <b>{duel.opponent_name}</b>",
         )
         await asyncio.sleep(PICK_DELAY)
+        if _duel_aborted(duel):
+            return
         await _send_ban_phase(callback.bot, duel)
 
     @dp.callback_query(F.data.startswith("dpl:"))
