@@ -2,3 +2,4 @@ numpy
 aiogram
 python-dotenv
 openai
+psycopg2-binary
