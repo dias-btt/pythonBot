@@ -7,6 +7,7 @@ from aiogram.filters import Command
 from aiogram.types import TelegramObject
 
 from naruto_characters import NARUTO_CHARACTERS
+from naruto_chemistry import format_chemistry_block, get_team_chemistry
 
 NARUTO_COMMANDS = ("/naruto_team", "/naruto")
 
@@ -153,7 +154,10 @@ async def _run_naruto_team(message: types.Message) -> None:
             await asyncio.sleep(MESSAGE_DELAY)
 
         ratings = [s["rating"] for s in team]
-        overall = round(sum(ratings) / len(ratings), 1)
+        base_overall = round(sum(ratings) / len(ratings), 1)
+        chem = get_team_chemistry(team)
+        chem_bonus = chem.rating_bonus if chem else 0
+        overall = round(min(100.0, base_overall + chem_bonus), 1)
         verdict = _team_verdict(overall)
 
         lines = ["🍥 <b>ИТОГОВАЯ КОМАНДА</b>\n"]
@@ -164,7 +168,16 @@ async def _run_naruto_team(message: types.Message) -> None:
             )
 
         lines.append("")
-        lines.append(f"📊 <b>Общий рейтинг:</b> {overall}/100 {_rating_bar(int(overall))}")
+        if chem:
+            lines.append(f"📊 <b>Базовый рейтинг:</b> {base_overall}/100")
+            lines.append(
+                f"⚡ <b>С бонусом химии (+{chem_bonus}):</b> {overall}/100 {_rating_bar(int(overall))}"
+            )
+            chem_line = format_chemistry_block(chem)
+            if chem_line:
+                lines.append(f"\n{chem_line}")
+        else:
+            lines.append(f"📊 <b>Общий рейтинг:</b> {overall}/100 {_rating_bar(int(overall))}")
         lines.append(f"\n{verdict}")
 
         await message.reply("\n".join(lines))

@@ -46,6 +46,10 @@ def resolve_jutsu_clash(
     guard2: bool,
     role_label: str,
     round_num: int,
+    heal_mult1: float = 1.0,
+    heal_mult2: float = 1.0,
+    dmg_reduce1: int = 0,
+    dmg_reduce2: int = 0,
 ) -> tuple[int, int, int, int, bool, bool, str]:
     """
     Returns: hp1, hp2, new_buff1, new_buff2, new_guard1, new_guard2, log_text
@@ -65,12 +69,12 @@ def resolve_jutsu_clash(
     # --- Heals ---
     heal1 = heal2 = 0
     if j1["type"] == "heal":
-        heal1 = min(j1["power"], 100 - hp1)
+        heal1 = int(min(j1["power"], 100 - hp1) * heal_mult1)
         hp1 += heal1
         used_buff1 = 0
         lines.append(f"💚 <b>{c1['name']}</b> — {j1['name']}: +{heal1} HP → {hp1}")
     if j2["type"] == "heal":
-        heal2 = min(j2["power"], 100 - hp2)
+        heal2 = int(min(j2["power"], 100 - hp2) * heal_mult2)
         hp2 += heal2
         used_buff2 = 0
         lines.append(f"💚 <b>{c2['name']}</b> — {j2['name']}: +{heal2} HP → {hp2}")
@@ -137,6 +141,8 @@ def resolve_jutsu_clash(
             if guard2:
                 raw = max(3, int(raw * 0.8))
                 ng2 = False
+            if dmg_reduce2:
+                raw = max(1, raw - int(raw * dmg_reduce2 / 100))
             hp2 = max(0, hp2 - raw)
             lines.append(
                 f"💥 <b>{c1['name']}</b> берёт линию! −{raw} HP у <b>{name2}</b>"
@@ -146,6 +152,8 @@ def resolve_jutsu_clash(
             if guard1:
                 raw = max(3, int(raw * 0.8))
                 ng1 = False
+            if dmg_reduce1:
+                raw = max(1, raw - int(raw * dmg_reduce1 / 100))
             hp1 = max(0, hp1 - raw)
             lines.append(
                 f"💥 <b>{c2['name']}</b> берёт линию! −{raw} HP у <b>{name1}</b>"

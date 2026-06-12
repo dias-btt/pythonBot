@@ -14,6 +14,12 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, TelegramOb
 from db import get_naruto_duel_ratings, record_naruto_duel_result
 from naruto_battle import resolve_jutsu_clash
 from naruto_characters import NARUTO_CHARACTERS
+from naruto_chemistry import (
+    ChemistryBonus,
+    chemistry_heal_multiplier,
+    format_chemistry_block,
+    get_team_chemistry,
+)
 from naruto_jutsu import get_jutsu_kit, jutsu_button_text
 from naruto_team import POSITIONS, ROLE_KEYS, _rating_bar, is_chat_busy
 
@@ -127,7 +133,8 @@ NO_ACCEPT_LINES = [
 INSTRUCTIONS_TEXT = (
     "📖 <b>ПРАВИЛА NARUTO DUEL — ТАКТИЧЕСКИЙ БОЙ</b>\n\n"
     "<b>0. Бан</b> — каждый банит 1 персонажа из 5 (для обоих недоступен)\n\n"
-    "<b>1. Драфт</b> — 6 ролей, раунды 4–6 только 2 варианта, 1 переролл\n\n"
+    "<b>1. Драфт</b> — 6 ролей, раунды 4–6 только 2 варианта, 1 переролл\n"
+    "• 🏘️ 3–6 ниндзя одной деревни = бонус химии (сила, чакра, хил, защита)\n\n"
     "<b>2. Подготовка</b> — стратегия, предмет, 🃏 туз (+12 в секретном раунде)\n\n"
     "<b>3. Тактический бой</b>\n"
     f"• У командира <b>{COMMANDER_CHAKRA_START}💠</b> чакры (+{CHAKRA_REGEN}/раунд)\n"
@@ -200,6 +207,7 @@ class Duel:
     started_at: float = field(default_factory=time.monotonic)
     last_active: dict[int, float] = field(default_factory=dict)
     inactivity_task: asyncio.Task | None = field(default=None, compare=False, repr=False)
+    team_chemistry: dict[int, ChemistryBonus | None] = field(default_factory=dict)
 
 
 def is_duel_active(chat_id: int) -> bool:
@@ -472,17 +480,6 @@ def _team_title(avg: float) -> str:
     return TEAM_TITLES[-1][1]
 
 
-def _village_synergy(team: list[dict[str, Any]]) -> str | None:
-    villages: dict[str, int] = {}
-    for slot in team:
-        v = slot["character"]["village"]
-        villages[v] = villages.get(v, 0) + 1
-    best_v, count = max(villages.items(), key=lambda x: x[1])
-    if count >= 3:
-        return f"🏘️ Синергия <b>{best_v}</b> ({count} ниндзя) — команда дышит в унисон!"
-    return None
-
-
 def _rivalry_line(c1: dict, c2: dict) -> str | None:
     pair = frozenset({c1["name"], c2["name"]})
     return RIVALRIES.get(pair)
@@ -498,9 +495,10 @@ def _format_team(name: str, team: list[dict[str, Any]]) -> str:
     avg = round(sum(s["rating"] for s in team) / len(team), 1)
     lines.append(f"\n📊 Сила: {avg}/100 {_rating_bar(int(avg))}")
     lines.append(f"🎖 {_team_title(avg)}")
-    synergy = _village_synergy(team)
-    if synergy:
-        lines.append(synergy)
+    chem = get_team_chemistry(team)
+    chem_line = format_chemistry_block(chem)
+    if chem_line:
+        lines.append(chem_line)
     return "\n".join(lines)
 
 
@@ -587,8 +585,14 @@ def _execute_jutsu_round(
             duel.scroll_used[uid2] = True
             extra.append(f"📜 Свиток <b>{name2}</b>: +{heal} HP")
 
+    chem1 = duel.team_chemistry.get(uid1)
+    chem2 = duel.team_chemistry.get(uid2)
     buff1 = duel.jutsu_buff.get(uid1, 0) + _strategy_bonus(duel.strategies[uid1])
     buff2 = duel.jutsu_buff.get(uid2, 0) + _strategy_bonus(duel.strategies[uid2])
+    if chem1:
+        buff1 += chem1.jutsu_power
+    if chem2:
+        buff2 += chem2.jutsu_power
     if duel.items.get(uid1) == "pill":
         buff1 += 6
     if duel.items.get(uid2) == "pill":
@@ -636,6 +640,10 @@ def _execute_jutsu_round(
         duel.guard_buff.get(uid1, False),
         duel.guard_buff.get(uid2, False),
         slot1["role_label"], round_num,
+        heal_mult1=chemistry_heal_multiplier(chem1),
+        heal_mult2=chemistry_heal_multiplier(chem2),
+        dmg_reduce1=chem1.damage_reduce_pct if chem1 else 0,
+        dmg_reduce2=chem2.damage_reduce_pct if chem2 else 0,
     )
     duel.jutsu_buff[uid1] = nb1
     duel.jutsu_buff[uid2] = nb2
@@ -918,6 +926,8 @@ async def _finish_draft(bot: Bot, duel: Duel) -> None:
 
         team1 = duel.teams[duel.challenger_id]
         team2 = duel.teams[duel.opponent_id]
+        duel.team_chemistry[duel.challenger_id] = get_team_chemistry(team1)
+        duel.team_chemistry[duel.opponent_id] = get_team_chemistry(team2)
 
         await _safe_send(
             bot,
@@ -953,7 +963,12 @@ async def _run_battle(bot: Bot, duel: Duel) -> None:
             uid2: [0, 0],
         }
         duel.battlefield = random.choice(list(BATTLEFIELDS))
-        duel.commander_chakra = {uid1: COMMANDER_CHAKRA_START, uid2: COMMANDER_CHAKRA_START}
+        chem1 = duel.team_chemistry.get(uid1)
+        chem2 = duel.team_chemistry.get(uid2)
+        duel.commander_chakra = {
+            uid1: COMMANDER_CHAKRA_START + (chem1.chakra_bonus if chem1 else 0),
+            uid2: COMMANDER_CHAKRA_START + (chem2.chakra_bonus if chem2 else 0),
+        }
         duel.jutsu_buff = {uid1: 0, uid2: 0}
         duel.guard_buff = {uid1: False, uid2: False}
 
@@ -967,6 +982,15 @@ async def _run_battle(bot: Bot, duel: Duel) -> None:
         if duel.items.get(uid1) == "cursed" or duel.items.get(uid2) == "cursed":
             cursed_note = "\n☠️ Проклятые печати снимают 8 HP в начале!"
 
+        chem_notes: list[str] = []
+        for uid, pname in ((uid1, duel.challenger_name), (uid2, duel.opponent_name)):
+            chem = duel.team_chemistry.get(uid)
+            if chem:
+                chem_notes.append(
+                    f"🏘️ <b>{pname}</b>: {chem.tier_name} ({chem.village} ×{chem.count}) — {chem.perks_short}"
+                )
+        chem_block = ("\n" + "\n".join(chem_notes)) if chem_notes else ""
+
         avg1 = sum(s["rating"] for s in team1) / len(team1)
         avg2 = sum(s["rating"] for s in team2) / len(team2)
         fav = duel.challenger_name if avg1 >= avg2 else duel.opponent_name
@@ -978,7 +1002,7 @@ async def _run_battle(bot: Bot, duel: Duel) -> None:
             f"⚔️ <b>БОЙ НАЧИНАЕТСЯ!</b>\n"
             f"<b>{duel.challenger_name}</b> 🆚 <b>{duel.opponent_name}</b>\n\n"
             f"📊 Фаворит: <b>{fav}</b> | Аутсайдер: <b>{underdog}</b>\n"
-            f"🌍 Поле: <b>{field_name}</b> — <i>{field_desc}</i>{cursed_note}\n"
+            f"🌍 Поле: <b>{field_name}</b> — <i>{field_desc}</i>{cursed_note}{chem_block}\n"
             f"{_hp_bar(hp1)} vs {_hp_bar(hp2)}",
         )
         await asyncio.sleep(BATTLE_DELAY)
