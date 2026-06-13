@@ -256,6 +256,41 @@ def get_score(user_id: int) -> int:
         return row[0] if row else 0
 
 
+def find_user_id_by_username(username: str) -> int | None:
+    name = username.lstrip("@").strip()
+    if not name:
+        return None
+    with _connection() as conn:
+        cur = _execute(
+            conn,
+            "SELECT user_id FROM alkashi WHERE LOWER(username) = LOWER(?)",
+            (name,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def transfer_score(from_id: int, to_id: int, amount: int) -> int:
+    with _connection() as conn:
+        cur = _execute(conn, "SELECT score FROM alkashi WHERE user_id = ?", (from_id,))
+        row = cur.fetchone()
+        available = row[0] if row else 0
+        actual = min(max(amount, 0), available)
+        if actual <= 0:
+            return 0
+        _execute(
+            conn,
+            "UPDATE alkashi SET score = score - ? WHERE user_id = ?",
+            (actual, from_id),
+        )
+        _execute(
+            conn,
+            "UPDATE alkashi SET score = score + ? WHERE user_id = ?",
+            (actual, to_id),
+        )
+        return actual
+
+
 def get_players_with_scores():
     with _connection() as conn:
         cur = _execute(

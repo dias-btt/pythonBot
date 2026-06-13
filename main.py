@@ -17,6 +17,7 @@ from maliks import MALIKS
 from naruto_team import register_naruto_team
 from naruto_duel import register_naruto_duel
 from russian_roulette import register_russian_roulette
+from steal import register_steal
 from db import add_sticker, sticker_exists
 from dotenv import load_dotenv
 import os
@@ -39,6 +40,7 @@ dp = Dispatcher()
 register_naruto_team(dp)
 register_naruto_duel(dp)
 register_russian_roulette(dp)
+register_steal(dp)
 
 # =========================
 # 🧠 LOAD MEMORY
