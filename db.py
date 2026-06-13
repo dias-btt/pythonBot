@@ -139,6 +139,18 @@ def _init_db() -> None:
                 )
                 """,
             )
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS command_bans (
+                    chat_id BIGINT NOT NULL,
+                    command TEXT NOT NULL,
+                    banned_at BIGINT NOT NULL,
+                    banned_by TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (chat_id, command)
+                )
+                """,
+            )
         else:
             _execute(
                 conn,
@@ -220,6 +232,18 @@ def _init_db() -> None:
                     steal_date TEXT NOT NULL,
                     count INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (user_id, steal_date)
+                )
+                """,
+            )
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS command_bans (
+                    chat_id INTEGER NOT NULL,
+                    command TEXT NOT NULL,
+                    banned_at INTEGER NOT NULL,
+                    banned_by TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (chat_id, command)
                 )
                 """,
             )
@@ -798,3 +822,60 @@ def repay_debt_amount(borrower_id: int, amount: int | None = None) -> tuple[int,
         settled.append(get_debt(debt["debt_id"]))
 
     return total_paid, settled
+
+
+def is_command_banned(chat_id: int, command: str) -> bool:
+    cmd = command.lstrip("/").lower()
+    with _connection() as conn:
+        cur = _execute(
+            conn,
+            "SELECT 1 FROM command_bans WHERE chat_id = ? AND command = ?",
+            (chat_id, cmd),
+        )
+        return cur.fetchone() is not None
+
+
+def ban_command(chat_id: int, command: str, banned_by: str = "") -> None:
+    cmd = command.lstrip("/").lower()
+    with _connection() as conn:
+        if _use_pg:
+            _execute(
+                conn,
+                """
+                INSERT INTO command_bans (chat_id, command, banned_at, banned_by)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (chat_id, command) DO UPDATE
+                SET banned_at = EXCLUDED.banned_at, banned_by = EXCLUDED.banned_by
+                """,
+                (chat_id, cmd, int(time.time()), banned_by),
+            )
+        else:
+            _execute(
+                conn,
+                """
+                INSERT OR REPLACE INTO command_bans (chat_id, command, banned_at, banned_by)
+                VALUES (?, ?, ?, ?)
+                """,
+                (chat_id, cmd, int(time.time()), banned_by),
+            )
+
+
+def unban_command(chat_id: int, command: str) -> bool:
+    cmd = command.lstrip("/").lower()
+    with _connection() as conn:
+        cur = _execute(
+            conn,
+            "DELETE FROM command_bans WHERE chat_id = ? AND command = ?",
+            (chat_id, cmd),
+        )
+        return cur.rowcount > 0
+
+
+def list_banned_commands(chat_id: int) -> list[tuple[str, str]]:
+    with _connection() as conn:
+        cur = _execute(
+            conn,
+            "SELECT command, banned_by FROM command_bans WHERE chat_id = ? ORDER BY command",
+            (chat_id,),
+        )
+        return cur.fetchall()
