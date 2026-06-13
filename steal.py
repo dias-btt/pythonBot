@@ -10,9 +10,10 @@ from aiogram.enums import MessageEntityType
 from aiogram.filters import Command, CommandObject
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from db import ensure_user, find_user_id_by_username, get_score, transfer_score
+from db import ensure_user, find_user_id_by_username, get_score, get_steal_count_today, increment_steal_count, transfer_score
 
 STEAL_TIMEOUT = 30
+MAX_STEALS_PER_DAY = 2
 
 STEAL_START_LINES = [
     "🦹 Кто-то полез в карман за баллами...",
@@ -272,6 +273,7 @@ def register_steal(dp: Dispatcher) -> None:
                 "<code>/steal @user 500</code> — стырить 500 баллов\n"
                 "<code>/steal 500</code> — ответом на сообщение жертвы\n\n"
                 "• Украсть можно от <b>1</b> до <b>твоего баланса</b>\n"
+                "• Максимум <b>2 кражи в день</b>\n"
                 "• Жертва <b>30 сек</b> жмёт 🛡️ — и ты теряешь сумму\n"
                 "• Не ответила — она теряет, ты забираешь"
             )
@@ -300,6 +302,14 @@ def register_steal(dp: Dispatcher) -> None:
             await message.reply("⏳ У тебя или жертвы уже идёт кража. Дождись результата.")
             return
 
+        steals_today = get_steal_count_today(attacker.id)
+        if steals_today >= MAX_STEALS_PER_DAY:
+            await message.reply(
+                f"🚫 Лимит краж на сегодня исчерпан (<b>{MAX_STEALS_PER_DAY}/{MAX_STEALS_PER_DAY}</b>).\n"
+                "Завтра снова можно стырить."
+            )
+            return
+
         attacker_score = get_score(attacker.id)
         victim_score = get_score(victim.id)
 
@@ -326,6 +336,8 @@ def register_steal(dp: Dispatcher) -> None:
         if amount < 1:
             await message.reply("🚫 У жертвы меньше баллов, чем ты хочешь стырить.")
             return
+
+        increment_steal_count(attacker.id)
 
         steal_id = uuid.uuid4().hex[:8]
         attempt = StealAttempt(

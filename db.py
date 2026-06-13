@@ -128,6 +128,17 @@ def _init_db() -> None:
                 )
                 """,
             )
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS steal_daily (
+                    user_id BIGINT NOT NULL,
+                    steal_date TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, steal_date)
+                )
+                """,
+            )
         else:
             _execute(
                 conn,
@@ -198,6 +209,17 @@ def _init_db() -> None:
                     last_interest_at INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'pending',
                     offer_msg_id INTEGER DEFAULT 0
+                )
+                """,
+            )
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS steal_daily (
+                    user_id INTEGER NOT NULL,
+                    steal_date TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, steal_date)
                 )
                 """,
             )
@@ -335,6 +357,50 @@ def transfer_score(from_id: int, to_id: int, amount: int) -> int:
             (actual, to_id),
         )
         return actual
+
+
+def get_steal_count_today(user_id: int, day: str | None = None) -> int:
+    from datetime import date
+
+    steal_date = day or date.today().isoformat()
+    with _connection() as conn:
+        cur = _execute(
+            conn,
+            "SELECT count FROM steal_daily WHERE user_id = ? AND steal_date = ?",
+            (user_id, steal_date),
+        )
+        row = cur.fetchone()
+    return row[0] if row else 0
+
+
+def increment_steal_count(user_id: int) -> int:
+    from datetime import date
+
+    steal_date = date.today().isoformat()
+    with _connection() as conn:
+        if _use_pg:
+            _execute(
+                conn,
+                """
+                INSERT INTO steal_daily (user_id, steal_date, count)
+                VALUES (?, ?, 1)
+                ON CONFLICT (user_id, steal_date)
+                DO UPDATE SET count = steal_daily.count + 1
+                """,
+                (user_id, steal_date),
+            )
+        else:
+            _execute(
+                conn,
+                """
+                INSERT INTO steal_daily (user_id, steal_date, count)
+                VALUES (?, ?, 1)
+                ON CONFLICT(user_id, steal_date)
+                DO UPDATE SET count = count + 1
+                """,
+                (user_id, steal_date),
+            )
+    return get_steal_count_today(user_id, steal_date)
 
 
 def get_players_with_scores():
