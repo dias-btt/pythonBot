@@ -105,6 +105,29 @@ def _init_db() -> None:
                 )
                 """,
             )
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS debts (
+                    debt_id TEXT PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    borrower_id BIGINT NOT NULL,
+                    borrower_name TEXT NOT NULL,
+                    lender_id BIGINT NOT NULL,
+                    lender_name TEXT NOT NULL,
+                    principal INTEGER NOT NULL,
+                    accrued_interest INTEGER NOT NULL DEFAULT 0,
+                    repaid INTEGER NOT NULL DEFAULT 0,
+                    interest_rate REAL NOT NULL,
+                    terms_label TEXT NOT NULL DEFAULT '',
+                    due_at BIGINT NOT NULL,
+                    created_at BIGINT NOT NULL,
+                    last_interest_at BIGINT NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    offer_msg_id BIGINT DEFAULT 0
+                )
+                """,
+            )
         else:
             _execute(
                 conn,
@@ -152,6 +175,29 @@ def _init_db() -> None:
                     wins_b INTEGER NOT NULL DEFAULT 0,
                     draws INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (user_a, user_b)
+                )
+                """,
+            )
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS debts (
+                    debt_id TEXT PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
+                    borrower_id INTEGER NOT NULL,
+                    borrower_name TEXT NOT NULL,
+                    lender_id INTEGER NOT NULL,
+                    lender_name TEXT NOT NULL,
+                    principal INTEGER NOT NULL,
+                    accrued_interest INTEGER NOT NULL DEFAULT 0,
+                    repaid INTEGER NOT NULL DEFAULT 0,
+                    interest_rate REAL NOT NULL,
+                    terms_label TEXT NOT NULL DEFAULT '',
+                    due_at INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    last_interest_at INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    offer_msg_id INTEGER DEFAULT 0
                 )
                 """,
             )
@@ -444,3 +490,245 @@ def get_naruto_duel_ratings(limit: int = 20):
             (limit,),
         )
         return cur.fetchall()
+
+
+def _debt_row_to_dict(row) -> dict:
+    keys = [
+        "debt_id", "chat_id", "borrower_id", "borrower_name", "lender_id", "lender_name",
+        "principal", "accrued_interest", "repaid", "interest_rate", "terms_label",
+        "due_at", "created_at", "last_interest_at", "status", "offer_msg_id",
+    ]
+    return dict(zip(keys, row))
+
+
+def debt_total_owed(debt: dict) -> int:
+    return max(0, debt["principal"] + debt["accrued_interest"] - debt["repaid"])
+
+
+def create_debt_pending(
+    debt_id: str,
+    chat_id: int,
+    borrower_id: int,
+    borrower_name: str,
+    lender_id: int,
+    lender_name: str,
+    principal: int,
+    offer_msg_id: int = 0,
+) -> None:
+    now = int(time.time())
+    due_at = now + 2 * 3600
+    with _connection() as conn:
+        _execute(
+            conn,
+            """
+            INSERT INTO debts (
+                debt_id, chat_id, borrower_id, borrower_name, lender_id, lender_name,
+                principal, interest_rate, terms_label, due_at, created_at, status, offer_msg_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?, ?, 'pending', ?)
+            """,
+            (
+                debt_id, chat_id, borrower_id, borrower_name, lender_id, lender_name,
+                principal, due_at, now, offer_msg_id,
+            ),
+        )
+
+
+def get_debt(debt_id: str) -> dict | None:
+    with _connection() as conn:
+        cur = _execute(conn, "SELECT * FROM debts WHERE debt_id = ?", (debt_id,))
+        row = cur.fetchone()
+    return _debt_row_to_dict(row) if row else None
+
+
+def update_debt_offer_msg(debt_id: str, message_id: int) -> None:
+    with _connection() as conn:
+        _execute(
+            conn,
+            "UPDATE debts SET offer_msg_id = ? WHERE debt_id = ?",
+            (message_id, debt_id),
+        )
+
+
+def set_debt_status(debt_id: str, status: str) -> None:
+    with _connection() as conn:
+        _execute(conn, "UPDATE debts SET status = ? WHERE debt_id = ?", (status, debt_id))
+
+
+def activate_debt(debt_id: str, interest_rate: float, terms_label: str) -> bool:
+    debt = get_debt(debt_id)
+    if not debt or debt["status"] != "pending":
+        return False
+    lender_score = get_score(debt["lender_id"])
+    if lender_score < debt["principal"]:
+        return False
+    transferred = transfer_score(debt["lender_id"], debt["borrower_id"], debt["principal"])
+    if transferred < debt["principal"]:
+        return False
+    now = int(time.time())
+    due_at = now + 2 * 3600
+    with _connection() as conn:
+        _execute(
+            conn,
+            """
+            UPDATE debts
+            SET status = 'active', interest_rate = ?, terms_label = ?,
+                due_at = ?, last_interest_at = ?, created_at = ?
+            WHERE debt_id = ?
+            """,
+            (interest_rate, terms_label, due_at, due_at, now, debt_id),
+        )
+    return True
+
+
+def borrower_has_active_debt(borrower_id: int) -> bool:
+    with _connection() as conn:
+        cur = _execute(
+            conn,
+            """
+            SELECT 1 FROM debts
+            WHERE borrower_id = ? AND status IN ('pending', 'active')
+            LIMIT 1
+            """,
+            (borrower_id,),
+        )
+        return cur.fetchone() is not None
+
+
+def lender_has_pending_from_borrower(lender_id: int, borrower_id: int) -> bool:
+    with _connection() as conn:
+        cur = _execute(
+            conn,
+            """
+            SELECT 1 FROM debts
+            WHERE lender_id = ? AND borrower_id = ? AND status = 'pending'
+            LIMIT 1
+            """,
+            (lender_id, borrower_id),
+        )
+        return cur.fetchone() is not None
+
+
+def get_active_debts_for_user(user_id: int) -> list[dict]:
+    with _connection() as conn:
+        cur = _execute(
+            conn,
+            """
+            SELECT * FROM debts
+            WHERE status = 'active' AND (borrower_id = ? OR lender_id = ?)
+            ORDER BY due_at ASC
+            """,
+            (user_id, user_id),
+        )
+        return [_debt_row_to_dict(row) for row in cur.fetchall()]
+
+
+def get_all_active_debts() -> list[dict]:
+    with _connection() as conn:
+        cur = _execute(
+            conn,
+            "SELECT * FROM debts WHERE status = 'active' ORDER BY due_at ASC",
+        )
+        return [_debt_row_to_dict(row) for row in cur.fetchall()]
+
+
+def accrue_debt_interest(debt_id: str) -> dict | None:
+    debt = get_debt(debt_id)
+    if not debt or debt["status"] != "active":
+        return debt
+
+    now = int(time.time())
+    if now <= debt["due_at"]:
+        return debt
+
+    owed = debt_total_owed(debt)
+    if owed <= 0:
+        set_debt_status(debt_id, "repaid")
+        return get_debt(debt_id)
+
+    last = debt["last_interest_at"] or debt["due_at"]
+    hours = min((now - last) // 3600, 168)
+    if hours < 1:
+        return debt
+
+    accrued = debt["accrued_interest"]
+    remaining = owed
+    rate = debt["interest_rate"]
+    for _ in range(hours):
+        add = max(1, int(remaining * rate)) if rate > 0 else 0
+        accrued += add
+        remaining = debt["principal"] + accrued - debt["repaid"]
+
+    new_last = last + hours * 3600
+    with _connection() as conn:
+        _execute(
+            conn,
+            "UPDATE debts SET accrued_interest = ?, last_interest_at = ? WHERE debt_id = ?",
+            (accrued, new_last, debt_id),
+        )
+    return get_debt(debt_id)
+
+
+def accrue_all_active_debts() -> list[dict]:
+    updated = []
+    for debt in get_all_active_debts():
+        updated.append(accrue_debt_interest(debt["debt_id"]))
+    return [d for d in updated if d]
+
+
+def expire_pending_debts(max_age: int) -> list[str]:
+    now = int(time.time())
+    with _connection() as conn:
+        cur = _execute(
+            conn,
+            "SELECT debt_id FROM debts WHERE status = 'pending' AND created_at < ?",
+            (now - max_age,),
+        )
+        ids = [row[0] for row in cur.fetchall()]
+        if ids:
+            _execute(
+                conn,
+                "UPDATE debts SET status = 'cancelled' WHERE status = 'pending' AND created_at < ?",
+                (now - max_age,),
+            )
+    return ids
+
+
+def repay_debt_amount(borrower_id: int, amount: int | None = None) -> tuple[int, list[dict]]:
+    accrue_all_active_debts()
+    debts = [
+        d for d in get_active_debts_for_user(borrower_id)
+        if d["borrower_id"] == borrower_id and debt_total_owed(d) > 0
+    ]
+    if not debts:
+        return 0, []
+
+    balance = get_score(borrower_id)
+    budget = balance if amount is None else min(amount, balance)
+    if budget <= 0:
+        return 0, debts
+
+    total_paid = 0
+    settled = []
+    for debt in debts:
+        if budget <= 0:
+            break
+        owed = debt_total_owed(debt)
+        if owed <= 0:
+            continue
+        pay = min(budget, owed)
+        transferred = transfer_score(borrower_id, debt["lender_id"], pay)
+        if transferred <= 0:
+            break
+        budget -= transferred
+        total_paid += transferred
+        new_repaid = debt["repaid"] + transferred
+        new_status = "repaid" if new_repaid >= debt["principal"] + debt["accrued_interest"] else "active"
+        with _connection() as conn:
+            _execute(
+                conn,
+                "UPDATE debts SET repaid = ?, status = ? WHERE debt_id = ?",
+                (new_repaid, new_status, debt["debt_id"]),
+            )
+        settled.append(get_debt(debt["debt_id"]))
+
+    return total_paid, settled
