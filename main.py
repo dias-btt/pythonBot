@@ -52,6 +52,7 @@ chat_memory = [
 from db import (
     ensure_user,
     add_score,
+    set_score,
     top_users,
     get_score,
     get_last_drink,
@@ -184,6 +185,7 @@ def _format_modes_help() -> str:
             f"{mode['emoji']} <code>/alyp_koyaik {key}</code> — "
             f"{mode['name']}: {mode['desc']}"
         )
+    lines.append("🎰 <code>/alyp_koyaik vabank</code> — ва-банк: удвой баллы или потеряй всё")
     lines.append("📊 <code>/alyp_koyaik stat</code> — статистика без выпивки")
     lines.append("⏳ <code>/alyp_koyaik poka</code> — таймер до следующей бутылки")
     return "\n".join(lines)
@@ -573,6 +575,10 @@ async def alyp_koyaiyk(message: types.Message, command: CommandObject):
             await message.reply("✅ Кулдаун прошёл — жми /alyp_koyaik и пей!")
         return
 
+    if arg in ("vabank", "вабанк", "allin", "all-in"):
+        await _vabank_start(message)
+        return
+
     if remaining > 0:
         await message.reply(
             f"🚫 Ты уже пил.\n\n"
@@ -633,6 +639,372 @@ async def alkashi_rating(message: types.Message):
         medal = medals[i - 1] if i <= 3 else f"{i}."
         text += f"{medal} {name} — {score} баллов\n"
     await message.reply(text)
+
+
+# =========================
+# 🎰 ВА-БАНК
+# =========================
+VABANK_CONFIRM_TTL = 60
+VABANK_CHOICE_TTL = 15
+
+VABANK_ROUNDS = [
+    {
+        "title": "🎰 Рулетка",
+        "question": "На что ставишь?",
+        "options": ["🔴 Красное", "⚫ Чёрное"],
+    },
+    {
+        "title": "🪙 Монетка",
+        "question": "Орёл или решка?",
+        "options": ["🦅 Орёл", "🪙 Решка"],
+    },
+    {
+        "title": "🍻 Залп судьбы",
+        "question": "Пить или разумно отказаться?",
+        "options": ["🍺 Пью!", "🧊 Не пью"],
+    },
+    {
+        "title": "👑 Малик",
+        "question": "Кого выбираешь?",
+        "options": ["🎭 Малик", "😤 Не Малик"],
+    },
+]
+
+VABANK_WIN_LINES = [
+    "🎉 ДЖЕКПОТ! Казино плачет, ты пьёшь шампанское!",
+    "💰 Фортуна улыбнулась — баллы удвоены!",
+    "🔥 Ты сыграл ва-банк и выиграл! Легенда.",
+    "🍀 Сегодня твой день. Удваиваем!",
+]
+
+VABANK_LOSE_LINES = [
+    "💀 Всё. Ноль. Даже квас не остался.",
+    "🚫 Казино забрало всё. Пора в рехаб баллов.",
+    "😵 Ва-банк не для слабаков... и не для тебя сегодня.",
+    "🤡 Ты проиграл всё. Малик отворачивается.",
+]
+
+VABANK_TIMEOUT_LINES = [
+    "⏰ Время вышло — казино забирает ставку автоматически!",
+    "⌛ Ты тупил слишком долго. Всё пропало.",
+]
+
+
+@dataclass
+class VabankSession:
+    session_id: str
+    user_id: int
+    user_name: str
+    stake: int
+    phase: str  # confirm | choice
+    winning_choice: int = 0
+    round_info: dict = field(default_factory=dict)
+    chat_id: int = 0
+    message_id: int = 0
+    created_at: int = 0
+    choice_started_at: int = 0
+    resolved: bool = False
+
+
+_active_vabank: dict[int, VabankSession] = {}
+_vabank_tasks: dict[str, asyncio.Task] = {}
+
+
+def _vabank_session(user_id: int) -> VabankSession | None:
+    session = _active_vabank.get(user_id)
+    if not session or session.resolved:
+        return None
+    ttl = VABANK_CONFIRM_TTL if session.phase == "confirm" else VABANK_CHOICE_TTL
+    started = session.choice_started_at if session.phase == "choice" else session.created_at
+    if time.time() - started > ttl:
+        _cleanup_vabank(session)
+        return None
+    return session
+
+
+def _vabank_confirm_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🎰 ВА-БАНК!", callback_data=f"vbk:yes:{session_id}"),
+                InlineKeyboardButton(text="❌ Назад", callback_data=f"vbk:no:{session_id}"),
+            ]
+        ]
+    )
+
+
+def _vabank_choice_keyboard(session_id: str, options: list[str]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=options[0],
+                    callback_data=f"vbk:pick:{session_id}:0",
+                ),
+                InlineKeyboardButton(
+                    text=options[1],
+                    callback_data=f"vbk:pick:{session_id}:1",
+                ),
+            ]
+        ]
+    )
+
+
+def _vabank_confirm_text(session: VabankSession) -> str:
+    remaining = max(0, VABANK_CONFIRM_TTL - (int(time.time()) - session.created_at))
+    return (
+        f"🎰 <b>ВА-БАНК</b>\n\n"
+        f"Игрок: <b>{session.user_name}</b>\n"
+        f"Ставка: <b>{session.stake}</b> баллов (всё, что есть)\n\n"
+        f"✅ Выигрыш → <b>{session.stake * 2}</b> баллов\n"
+        f"❌ Проигрыш → <b>0</b> баллов\n\n"
+        f"⚠️ После подтверждения — мини-игра на 50/50 с таймером.\n"
+        f"⏳ Подтверди за <b>{remaining}</b> сек."
+    )
+
+
+def _vabank_choice_text(session: VabankSession) -> str:
+    remaining = max(0, VABANK_CHOICE_TTL - (int(time.time()) - session.choice_started_at))
+    info = session.round_info
+    pressure = ""
+    if remaining <= 5:
+        pressure = "\n🔥 <b>БЫСТРЕЕ! ВРЕМЯ УХОДИТ!</b>"
+    elif remaining <= 10:
+        pressure = "\n⚡ Торопись, казино не ждёт!"
+    return (
+        f"{info['title']}\n\n"
+        f"Ставка: <b>{session.stake}</b> баллов\n"
+        f"{info['question']}\n\n"
+        f"⏳ Осталось: <b>{remaining}</b> сек.{pressure}"
+    )
+
+
+def _cleanup_vabank(session: VabankSession) -> None:
+    _active_vabank.pop(session.user_id, None)
+    task = _vabank_tasks.pop(session.session_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def _edit_vabank_message(bot: Bot, session: VabankSession, text: str, markup=None):
+    if not session.chat_id or not session.message_id:
+        return
+    try:
+        await bot.edit_message_text(
+            text,
+            chat_id=session.chat_id,
+            message_id=session.message_id,
+            reply_markup=markup,
+        )
+    except Exception:
+        pass
+
+
+async def _resolve_vabank(bot: Bot, session: VabankSession, won: bool, reason: str):
+    if session.resolved:
+        return
+    session.resolved = True
+    _cleanup_vabank(session)
+
+    if won:
+        add_score(session.user_id, session.stake)
+        total = get_score(session.user_id)
+        title = _drunk_title(total)
+        text = (
+            f"🎰 <b>ВА-БАНК — ПОБЕДА!</b>\n\n"
+            f"{random.choice(VABANK_WIN_LINES)}\n\n"
+            f"➕ <b>+{session.stake}</b> баллов\n"
+            f"🏆 Всего: <b>{total}</b> ({title})\n\n"
+            f"<i>{reason}</i>"
+        )
+    else:
+        set_score(session.user_id, 0)
+        text = (
+            f"🎰 <b>ВА-БАНК — ПРОИГРЫШ</b>\n\n"
+            f"{random.choice(VABANK_LOSE_LINES)}\n\n"
+            f"➖ Потеряно: <b>{session.stake}</b> баллов\n"
+            f"🏆 Всего: <b>0</b>\n\n"
+            f"<i>{reason}</i>"
+        )
+
+    await _edit_vabank_message(bot, session, text, markup=None)
+
+
+async def _vabank_confirm_countdown(bot: Bot, session: VabankSession):
+    try:
+        while not session.resolved:
+            elapsed = int(time.time()) - session.created_at
+            if elapsed >= VABANK_CONFIRM_TTL:
+                session.resolved = True
+                _cleanup_vabank(session)
+                await _edit_vabank_message(
+                    bot,
+                    session,
+                    "🎰 <b>ВА-БАНК отменён</b>\n\n⏰ Время на подтверждение вышло.",
+                )
+                return
+            if session.phase != "confirm":
+                return
+            await _edit_vabank_message(
+                bot,
+                session,
+                _vabank_confirm_text(session),
+                _vabank_confirm_keyboard(session.session_id),
+            )
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        return
+
+
+async def _vabank_choice_countdown(bot: Bot, session: VabankSession):
+    try:
+        while not session.resolved:
+            elapsed = int(time.time()) - session.choice_started_at
+            if elapsed >= VABANK_CHOICE_TTL:
+                await _resolve_vabank(
+                    bot,
+                    session,
+                    False,
+                    random.choice(VABANK_TIMEOUT_LINES),
+                )
+                return
+            await _edit_vabank_message(
+                bot,
+                session,
+                _vabank_choice_text(session),
+                _vabank_choice_keyboard(session.session_id, session.round_info["options"]),
+            )
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        return
+
+
+async def _vabank_start(message: types.Message):
+    user = message.from_user
+    ensure_user(user.id, user.username or user.first_name)
+
+    if _vabank_session(user.id):
+        await message.reply("⏳ У тебя уже идёт ва-банк. Жми кнопки в том сообщении.")
+        return
+
+    stake = get_score(user.id)
+    if stake <= 0:
+        await message.reply("🚫 Нечего ставить — сначала набери баллы выпивкой!")
+        return
+
+    session_id = uuid.uuid4().hex[:8]
+    session = VabankSession(
+        session_id=session_id,
+        user_id=user.id,
+        user_name=user.username or user.first_name or "Анон",
+        stake=stake,
+        phase="confirm",
+        created_at=int(time.time()),
+    )
+    _active_vabank[user.id] = session
+
+    sent = await message.reply(
+        _vabank_confirm_text(session),
+        reply_markup=_vabank_confirm_keyboard(session_id),
+    )
+    session.chat_id = sent.chat.id
+    session.message_id = sent.message_id
+    _vabank_tasks[session_id] = asyncio.create_task(_vabank_confirm_countdown(bot, session))
+
+
+async def _vabank_begin_choice(bot: Bot, session: VabankSession):
+    session.phase = "choice"
+    session.round_info = random.choice(VABANK_ROUNDS)
+    session.winning_choice = random.randint(0, 1)
+    session.choice_started_at = int(time.time())
+
+    old_task = _vabank_tasks.pop(session.session_id, None)
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    await _edit_vabank_message(
+        bot,
+        session,
+        _vabank_choice_text(session),
+        _vabank_choice_keyboard(session.session_id, session.round_info["options"]),
+    )
+    _vabank_tasks[session.session_id] = asyncio.create_task(_vabank_choice_countdown(bot, session))
+
+
+@dp.callback_query(F.data.startswith("vbk:"))
+async def vabank_callback(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Ошибка данных", show_alert=True)
+        return
+
+    action = parts[1]
+    session_id = parts[2]
+    session = None
+    for candidate in _active_vabank.values():
+        if candidate.session_id == session_id and not candidate.resolved:
+            session = candidate
+            break
+
+    if not session:
+        await callback.answer("Сессия уже неактуальна", show_alert=True)
+        return
+
+    user = callback.from_user
+    if user.id != session.user_id:
+        await callback.answer("Это не твой ва-банк!", show_alert=True)
+        return
+
+    if action == "no":
+        if session.phase != "confirm":
+            await callback.answer("Уже поздно отменять", show_alert=True)
+            return
+        session.resolved = True
+        _cleanup_vabank(session)
+        await _edit_vabank_message(
+            callback.bot,
+            session,
+            "🎰 <b>ВА-БАНК отменён</b>\n\nТы передумал. Мудро... или трусишь?",
+        )
+        await callback.answer("Отменено")
+        return
+
+    if action == "yes":
+        if session.phase != "confirm":
+            await callback.answer("Подтверждение уже неактуально", show_alert=True)
+            return
+        if int(time.time()) - session.created_at > VABANK_CONFIRM_TTL:
+            await callback.answer("Время вышло", show_alert=True)
+            return
+        await callback.answer("Поехали! Выбирай быстро!")
+        await _vabank_begin_choice(callback.bot, session)
+        return
+
+    if action == "pick":
+        if len(parts) != 4 or session.phase != "choice":
+            await callback.answer("Выбор уже неактуален", show_alert=True)
+            return
+        if int(time.time()) - session.choice_started_at > VABANK_CHOICE_TTL:
+            await callback.answer("Время вышло!", show_alert=True)
+            return
+
+        try:
+            choice = int(parts[3])
+        except ValueError:
+            await callback.answer("Ошибка данных", show_alert=True)
+            return
+
+        won = choice == session.winning_choice
+        options = session.round_info["options"]
+        picked = options[choice]
+        winning = options[session.winning_choice]
+        reason = f"Ты выбрал: {picked}\nВыпало: {winning}"
+        await callback.answer("🎰 Крутим барабан..." if won else "💀 Не повезло...")
+        await asyncio.sleep(1.2)
+        await _resolve_vabank(callback.bot, session, won, reason)
+        return
+
+    await callback.answer("Неизвестное действие", show_alert=True)
 
 
 # =========================

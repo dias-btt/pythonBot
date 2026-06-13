@@ -214,6 +214,15 @@ def add_score(user_id: int, points: int) -> None:
         )
 
 
+def set_score(user_id: int, score: int) -> None:
+    with _connection() as conn:
+        _execute(
+            conn,
+            "UPDATE alkashi SET score = ? WHERE user_id = ?",
+            (score, user_id),
+        )
+
+
 def top_users(limit: int = 10):
     with _connection() as conn:
         cur = _execute(
