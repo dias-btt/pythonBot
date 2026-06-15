@@ -20,6 +20,11 @@ from russian_roulette import register_russian_roulette
 from steal import register_steal
 from dolg import register_dolg
 from command_ban import register_command_ban
+from duel_alk import register_duel_alk
+from dice import register_dice
+from quiz import register_quiz
+from guess_ninja import register_guess_ninja
+from naruto_bet import register_naruto_bet
 from db import add_sticker, sticker_exists
 from dotenv import load_dotenv
 import os
@@ -45,6 +50,11 @@ register_naruto_duel(dp)
 register_russian_roulette(dp)
 register_steal(dp)
 register_dolg(dp)
+register_duel_alk(dp)
+register_dice(dp)
+register_quiz(dp)
+register_guess_ninja(dp)
+register_naruto_bet(dp)
 
 # =========================
 # 🧠 LOAD MEMORY

@@ -151,6 +151,18 @@ def _init_db() -> None:
                 )
                 """,
             )
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS game_daily (
+                    user_id BIGINT NOT NULL,
+                    game_key TEXT NOT NULL,
+                    play_date TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, game_key, play_date)
+                )
+                """,
+            )
         else:
             _execute(
                 conn,
@@ -244,6 +256,18 @@ def _init_db() -> None:
                     banned_at INTEGER NOT NULL,
                     banned_by TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (chat_id, command)
+                )
+                """,
+            )
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS game_daily (
+                    user_id INTEGER NOT NULL,
+                    game_key TEXT NOT NULL,
+                    play_date TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, game_key, play_date)
                 )
                 """,
             )
@@ -395,6 +419,50 @@ def get_steal_count_today(user_id: int, day: str | None = None) -> int:
         )
         row = cur.fetchone()
     return row[0] if row else 0
+
+
+def get_game_count_today(user_id: int, game_key: str, day: str | None = None) -> int:
+    from datetime import date
+
+    play_date = day or date.today().isoformat()
+    with _connection() as conn:
+        cur = _execute(
+            conn,
+            "SELECT count FROM game_daily WHERE user_id = ? AND game_key = ? AND play_date = ?",
+            (user_id, game_key, play_date),
+        )
+        row = cur.fetchone()
+    return row[0] if row else 0
+
+
+def increment_game_count(user_id: int, game_key: str) -> int:
+    from datetime import date
+
+    play_date = date.today().isoformat()
+    with _connection() as conn:
+        if _use_pg:
+            _execute(
+                conn,
+                """
+                INSERT INTO game_daily (user_id, game_key, play_date, count)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT (user_id, game_key, play_date)
+                DO UPDATE SET count = game_daily.count + 1
+                """,
+                (user_id, game_key, play_date),
+            )
+        else:
+            _execute(
+                conn,
+                """
+                INSERT INTO game_daily (user_id, game_key, play_date, count)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(user_id, game_key, play_date)
+                DO UPDATE SET count = count + 1
+                """,
+                (user_id, game_key, play_date),
+            )
+    return get_game_count_today(user_id, game_key, play_date)
 
 
 def increment_steal_count(user_id: int) -> int:

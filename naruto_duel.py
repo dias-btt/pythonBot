@@ -220,6 +220,43 @@ def is_duel_active(chat_id: int) -> bool:
     )
 
 
+def get_bettable_duel(chat_id: int) -> Duel | None:
+    duel_id = _chat_duel.get(chat_id)
+    if not duel_id:
+        return None
+    duel = _duels.get(duel_id)
+    if duel and duel.phase in ("waiting", "instructions"):
+        return duel
+    return None
+
+
+async def _bet_close(bot: Bot, duel: Duel) -> None:
+    try:
+        from naruto_bet import close_betting
+
+        await close_betting(bot, duel)
+    except Exception:
+        pass
+
+
+async def _bet_accepted(bot: Bot, duel: Duel) -> None:
+    try:
+        from naruto_bet import on_duel_accepted
+
+        await on_duel_accepted(bot, duel)
+    except Exception:
+        pass
+
+
+async def _bet_resolve(bot: Bot, duel: Duel, winner_id: int | None) -> None:
+    try:
+        from naruto_bet import resolve_bets
+
+        await resolve_bets(bot, duel, winner_id)
+    except Exception:
+        pass
+
+
 def _get_duel_in_chat(chat_id: int) -> Duel | None:
     duel_id = _chat_duel.get(chat_id)
     if not duel_id:
@@ -279,6 +316,7 @@ async def _inactivity_watch(bot: Bot, duel: Duel) -> None:
                         return
                     msg = random.choice(NO_ACCEPT_LINES).format(name=duel.challenger_name)
                     await _safe_send(bot, duel.chat_id, msg)
+                    await _bet_resolve(bot, duel, None)
                     await _cleanup_duel(duel)
                 continue
 
@@ -295,6 +333,7 @@ async def _inactivity_watch(bot: Bot, duel: Duel) -> None:
                     other = _player_name(duel, other_id) if other_id else "соперник"
                     msg = random.choice(AFK_LEFT_LINES).format(name=name, other=other)
                     await _safe_send(bot, duel.chat_id, msg)
+                    await _bet_resolve(bot, duel, None)
                     await _cleanup_duel(duel)
                     return
     except asyncio.CancelledError:
@@ -311,6 +350,7 @@ async def _cancel_duel(bot: Bot, duel: Duel, canceller_name: str) -> None:
         f"🛑 <b>Duel отменён</b> инициатором <b>{canceller_name}</b>.\n"
         f"{opponent} свободен. Чат снова открыт.",
     )
+    await _bet_resolve(bot, duel, None)
     await _cleanup_duel(duel)
 
 
@@ -765,6 +805,7 @@ async def _cleanup_duel(duel: Duel) -> None:
 
 
 async def _send_ban_phase(bot: Bot, duel: Duel) -> None:
+    await _bet_close(bot, duel)
     duel.phase = "ban"
     await _safe_send(
         bot,
@@ -952,6 +993,7 @@ async def _finish_draft(bot: Bot, duel: Duel) -> None:
 
 
 async def _run_battle(bot: Bot, duel: Duel) -> None:
+    winner_id: int | None = None
     try:
         duel.phase = "battle"
         team1 = duel.teams[duel.challenger_id]
@@ -1108,6 +1150,7 @@ async def _run_battle(bot: Bot, duel: Duel) -> None:
 
         final += h2h_line
         await _safe_send(bot, duel.chat_id, final)
+        await _bet_resolve(bot, duel, winner_id)
     finally:
         if duel.id in _duels:
             duel.phase = "done"
@@ -1127,7 +1170,7 @@ class DuelBlockMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         cmd = text.split()[0].split("@")[0].lower()
-        if cmd in ("/otboi",):
+        if cmd in ("/otboi", "/naruto_bet"):
             return await handler(event, data)
         if cmd in DUEL_COMMANDS:
             await event.reply("⏳ Duel уже идёт в этом чате!")
@@ -1272,6 +1315,7 @@ def register_naruto_duel(dp: Dispatcher) -> None:
             f"Сначала прочитайте правила и подтвердите готовность.",
         )
         await _send_instructions(callback.bot, duel)
+        await _bet_accepted(callback.bot, duel)
 
     @dp.callback_query(F.data.startswith("dir:"))
     async def duel_read_instructions(callback: types.CallbackQuery):
