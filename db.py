@@ -721,6 +721,9 @@ def get_all_active_debts() -> list[dict]:
         return [_debt_row_to_dict(row) for row in cur.fetchall()]
 
 
+_MAX_ACCRUED_INTEREST = 2_147_483_647  # PostgreSQL INTEGER max
+
+
 def accrue_debt_interest(debt_id: str) -> dict | None:
     debt = get_debt(debt_id)
     if not debt or debt["status"] != "active":
@@ -740,12 +743,14 @@ def accrue_debt_interest(debt_id: str) -> dict | None:
     if hours < 1:
         return debt
 
-    accrued = debt["accrued_interest"]
+    accrued = min(debt["accrued_interest"], _MAX_ACCRUED_INTEREST)
     remaining = owed
     rate = debt["interest_rate"]
     for _ in range(hours):
+        if accrued >= _MAX_ACCRUED_INTEREST:
+            break
         add = max(1, int(remaining * rate)) if rate > 0 else 0
-        accrued += add
+        accrued = min(_MAX_ACCRUED_INTEREST, accrued + add)
         remaining = debt["principal"] + accrued - debt["repaid"]
 
     new_last = last + hours * 3600

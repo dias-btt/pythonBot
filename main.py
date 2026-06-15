@@ -275,29 +275,16 @@ async def answer(message: types.Message, command: CommandObject):
 async def poebat(message: types.Message, command: CommandObject):
     user = message.from_user
     
-    # Get target user
     target = None
+    target_name = None
     
-    # 1. If replied to someone
     if message.reply_to_message:
         target = message.reply_to_message.from_user
-    # 2. If mentioned username after command
-    elif command.args:
-        args = command.args.strip()
-        # Try to find user by username
-        if args.startswith('@'):
-            username = args[1:].lower()
-            # For simplicity we can just use the text as name
-            target_name = args
-        else:
-            target_name = args
-    else:
-        # Random victim if no target
-        target = user  # or make it random member, but harder
-    
-    if message.reply_to_message:
         target_name = target.full_name or target.username or "анон"
-    elif not target_name:
+    elif command.args:
+        target_name = command.args.strip()
+    else:
+        target = user
         target_name = user.full_name or user.username or "ты"
     
     # Special cases

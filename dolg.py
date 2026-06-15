@@ -266,9 +266,12 @@ async def _notify_debt_milestones(bot: Bot) -> None:
 async def _debt_watch_loop(bot: Bot) -> None:
     try:
         while True:
-            _expire_stale_pending()
-            accrue_all_active_debts()
-            await _notify_debt_milestones(bot)
+            try:
+                _expire_stale_pending()
+                accrue_all_active_debts()
+                await _notify_debt_milestones(bot)
+            except Exception:
+                pass
             await asyncio.sleep(60)
     except asyncio.CancelledError:
         return
