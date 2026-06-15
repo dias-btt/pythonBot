@@ -16,8 +16,10 @@ from db import (
     debt_total_owed,
     ensure_user,
     expire_pending_debts,
+    forgive_debt,
     get_active_debts_for_user,
     get_all_active_debts,
+    get_borrower_active_debt,
     get_debt,
     get_score,
     lender_has_pending_from_borrower,
@@ -69,6 +71,13 @@ ACCEPT_LINES = [
     "🤝 Сделка заключена. Часы пошли.",
     "💰 Баллы ушли в долг. Возврат через 2 часа — или проценты.",
     "📈 Кредит одобрен. Не облажайся с возвратом.",
+]
+
+SORRY_LINES = [
+    "🙏 Прости, банкир... больше не буду.",
+    "😭 Не тяну проценты. Может, простишь?",
+    "🧎 В долгах как в грехах — прошу отпущения.",
+    "💔 Баллов нет, совесть есть. Прости долг?",
 ]
 
 WARN_LINES = {
@@ -152,6 +161,38 @@ def _offer_keyboard(debt_id: str) -> InlineKeyboardMarkup:
         ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _sorry_text(debt: dict) -> str:
+    owed = debt_total_owed(debt)
+    interest_part = ""
+    if debt["accrued_interest"] > 0:
+        interest_part = f" ({debt['principal']} + {debt['accrued_interest']} процентов)"
+    return (
+        f"🙏 <b>ПРОСЬБА О ПРОЩЕНИИ</b>\n\n"
+        f"{random.choice(SORRY_LINES)}\n\n"
+        f"🙋 <b>{debt['borrower_name']}</b> просит простить долг\n"
+        f"🏦 Кредитор: <b>{debt['lender_name']}</b>\n"
+        f"💰 К выплате: <b>{owed}</b> баллов{interest_part}\n\n"
+        f"<b>{debt['lender_name']}</b>, простить и обнулить?"
+    )
+
+
+def _sorry_keyboard(debt_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🤝 Простить",
+                    callback_data=f"srry:yes:{debt_id}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Нет",
+                    callback_data=f"srry:no:{debt_id}",
+                ),
+            ],
+        ]
+    )
 
 
 def _debt_status_text(debt: dict) -> str:
@@ -336,7 +377,8 @@ def register_dolg(dp: Dispatcher) -> None:
                 "<code>/dolg @user 5000</code> — попросить 5000 в долг\n"
                 "<code>/dolg pay</code> — вернуть всё возможное\n"
                 "<code>/dolg pay 1000</code> — частичный возврат\n"
-                "<code>/dolg status</code> — мои долги\n\n"
+                "<code>/dolg status</code> — мои долги\n"
+                "<code>/sorry</code> — попросить кредитора простить долг\n\n"
                 "<b>Как работает:</b>\n"
                 "• Кредитор выбирает условия (проценты после просрочки)\n"
                 "• <b>2 часа</b> на возврат без процентов\n"
@@ -533,6 +575,129 @@ def register_dolg(dp: Dispatcher) -> None:
                     f"💸 <b>{debt['borrower_name']}</b>, тебе дали <b>{debt['principal']}</b>!\n"
                     f"Верни за 2 часа, иначе <b>{int(terms['rate'] * 100)}%/час</b>.\n"
                     f"<code>/dolg pay</code> — вернуть",
+                )
+            except Exception:
+                pass
+            return
+
+        await callback.answer("Неизвестное действие", show_alert=True)
+
+    @dp.message(Command("sorry"))
+    async def sorry_cmd(message: types.Message, command: CommandObject):
+        if message.chat.type not in ("group", "supergroup"):
+            await message.reply("🙏 Просить прощения можно только в группе!")
+            return
+
+        user = message.from_user
+        if not user:
+            return
+
+        _ensure_watch(message.bot)
+        ensure_user(user.id, _user_name(user))
+
+        args_text = (command.args or "").strip()
+        lender = await _resolve_target(message, args_text) if args_text else None
+        if lender and lender.is_bot:
+            await message.reply("🤖 Боты долги не прощают.")
+            return
+        if lender and lender.id == user.id:
+            await message.reply("🪞 Себя простить? Сначала /dolg pay.")
+            return
+
+        accrue_all_active_debts()
+        debt = get_borrower_active_debt(
+            user.id,
+            lender.id if lender else None,
+        )
+        if not debt:
+            if lender:
+                await message.reply(
+                    f"📭 У тебя нет активного долга перед <b>{_user_name(lender)}</b>.\n"
+                    "<code>/dolg status</code>"
+                )
+            else:
+                await message.reply(
+                    "📭 Нет активного долга, который можно простить.\n"
+                    "<code>/dolg status</code>"
+                )
+            return
+
+        owed = debt_total_owed(debt)
+        if owed <= 0:
+            await message.reply("✅ Долг уже закрыт.")
+            return
+
+        await message.reply(
+            _sorry_text(debt),
+            reply_markup=_sorry_keyboard(debt["debt_id"]),
+        )
+
+    @dp.callback_query(F.data.startswith("srry:"))
+    async def sorry_callback(callback: types.CallbackQuery):
+        parts = callback.data.split(":")
+        if len(parts) != 3:
+            await callback.answer("Ошибка данных", show_alert=True)
+            return
+
+        action, debt_id = parts[1], parts[2]
+        debt = get_debt(debt_id)
+        if not debt or debt["status"] != "active":
+            await callback.answer("Долг уже неактуален", show_alert=True)
+            return
+
+        user = callback.from_user
+        if not user:
+            return
+
+        if user.id != debt["lender_id"]:
+            await callback.answer("Только кредитор решает!", show_alert=True)
+            return
+
+        if action == "no":
+            owed = debt_total_owed(debt)
+            try:
+                await callback.message.edit_text(
+                    f"❌ <b>Без прощения</b>\n\n"
+                    f"<b>{debt['lender_name']}</b> не простил "
+                    f"<b>{debt['borrower_name']}</b>.\n"
+                    f"💰 Долг: <b>{owed}</b> баллов\n"
+                    f"💡 Вернуть: <code>/dolg pay</code>",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            await callback.answer("Отказано")
+            return
+
+        if action == "yes":
+            forgiven = forgive_debt(debt_id)
+            if not forgiven:
+                await callback.answer("Не удалось простить долг", show_alert=True)
+                return
+
+            try:
+                await callback.message.edit_text(
+                    f"🤝 <b>ДОЛГ ПРОЩЁН</b>\n\n"
+                    f"<b>{debt['lender_name']}</b> простил "
+                    f"<b>{debt['borrower_name']}</b>!\n"
+                    f"💸 Обнулено: <b>{debt['principal']}</b>"
+                    + (
+                        f" + <b>{forgiven['accrued_interest']}</b> процентов"
+                        if forgiven["accrued_interest"] > 0
+                        else ""
+                    )
+                    + " баллов\n"
+                    f"🎉 Должник свободен.",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            await callback.answer("Прощено!")
+            try:
+                await callback.bot.send_message(
+                    debt["chat_id"],
+                    f"🤝 <b>{debt['borrower_name']}</b>, "
+                    f"<b>{debt['lender_name']}</b> простил твой долг!",
                 )
             except Exception:
                 pass

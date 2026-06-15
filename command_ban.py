@@ -16,6 +16,7 @@ PROTECTED_COMMANDS = {"ban", "unban", "bans", "info", "start"}
 BANNABLE_COMMANDS = {
     "steal": "🦹 Кража баллов",
     "dolg": "💸 Долги",
+    "sorry": "🙏 Прощение долга",
     "roulette": "🔫 Русская рулетка",
     "duel": "⚔️ Naruto duel",
     "otboi": "🛑 Отмена duel",

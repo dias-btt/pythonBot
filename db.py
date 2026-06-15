@@ -698,6 +698,47 @@ def lender_has_pending_from_borrower(lender_id: int, borrower_id: int) -> bool:
         return cur.fetchone() is not None
 
 
+def get_borrower_active_debt(borrower_id: int, lender_id: int | None = None) -> dict | None:
+    with _connection() as conn:
+        if lender_id is not None:
+            cur = _execute(
+                conn,
+                """
+                SELECT * FROM debts
+                WHERE borrower_id = ? AND lender_id = ? AND status = 'active'
+                LIMIT 1
+                """,
+                (borrower_id, lender_id),
+            )
+        else:
+            cur = _execute(
+                conn,
+                """
+                SELECT * FROM debts
+                WHERE borrower_id = ? AND status = 'active'
+                LIMIT 1
+                """,
+                (borrower_id,),
+            )
+        row = cur.fetchone()
+    return _debt_row_to_dict(row) if row else None
+
+
+def forgive_debt(debt_id: str) -> dict | None:
+    accrue_debt_interest(debt_id)
+    debt = get_debt(debt_id)
+    if not debt or debt["status"] != "active":
+        return None
+    total = debt["principal"] + debt["accrued_interest"]
+    with _connection() as conn:
+        _execute(
+            conn,
+            "UPDATE debts SET repaid = ?, status = 'forgiven' WHERE debt_id = ?",
+            (total, debt_id),
+        )
+    return get_debt(debt_id)
+
+
 def get_active_debts_for_user(user_id: int) -> list[dict]:
     with _connection() as conn:
         cur = _execute(
