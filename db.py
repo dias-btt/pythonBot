@@ -725,16 +725,19 @@ def get_borrower_active_debt(borrower_id: int, lender_id: int | None = None) -> 
 
 
 def forgive_debt(debt_id: str) -> dict | None:
-    accrue_debt_interest(debt_id)
     debt = get_debt(debt_id)
     if not debt or debt["status"] != "active":
         return None
-    total = debt["principal"] + debt["accrued_interest"]
+    # Обнуляем без записи гигантского repaid — иначе INTEGER в Postgres переполняется.
     with _connection() as conn:
         _execute(
             conn,
-            "UPDATE debts SET repaid = ?, status = 'forgiven' WHERE debt_id = ?",
-            (total, debt_id),
+            """
+            UPDATE debts
+            SET accrued_interest = 0, repaid = principal, status = 'forgiven'
+            WHERE debt_id = ?
+            """,
+            (debt_id,),
         )
     return get_debt(debt_id)
 

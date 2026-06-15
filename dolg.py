@@ -649,12 +649,13 @@ def register_dolg(dp: Dispatcher) -> None:
         if not user:
             return
 
-        if user.id != debt["lender_id"]:
+        if int(user.id) != int(debt["lender_id"]):
             await callback.answer("Только кредитор решает!", show_alert=True)
             return
 
         if action == "no":
             owed = debt_total_owed(debt)
+            await callback.answer("Отказано")
             try:
                 await callback.message.edit_text(
                     f"❌ <b>Без прощения</b>\n\n"
@@ -666,33 +667,31 @@ def register_dolg(dp: Dispatcher) -> None:
                 )
             except Exception:
                 pass
-            await callback.answer("Отказано")
             return
 
         if action == "yes":
-            forgiven = forgive_debt(debt_id)
+            owed_before = debt_total_owed(debt)
+            try:
+                forgiven = forgive_debt(debt_id)
+            except Exception:
+                await callback.answer("Не удалось простить долг", show_alert=True)
+                return
             if not forgiven:
                 await callback.answer("Не удалось простить долг", show_alert=True)
                 return
 
+            await callback.answer("Прощено!")
             try:
                 await callback.message.edit_text(
                     f"🤝 <b>ДОЛГ ПРОЩЁН</b>\n\n"
                     f"<b>{debt['lender_name']}</b> простил "
                     f"<b>{debt['borrower_name']}</b>!\n"
-                    f"💸 Обнулено: <b>{debt['principal']}</b>"
-                    + (
-                        f" + <b>{forgiven['accrued_interest']}</b> процентов"
-                        if forgiven["accrued_interest"] > 0
-                        else ""
-                    )
-                    + " баллов\n"
+                    f"💸 Обнулено: <b>{owed_before}</b> баллов\n"
                     f"🎉 Должник свободен.",
                     reply_markup=None,
                 )
             except Exception:
                 pass
-            await callback.answer("Прощено!")
             try:
                 await callback.bot.send_message(
                     debt["chat_id"],
