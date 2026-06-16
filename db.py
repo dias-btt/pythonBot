@@ -529,6 +529,15 @@ def get_players_with_scores():
         return cur.fetchall()
 
 
+def get_all_alkashi_users():
+    with _connection() as conn:
+        cur = _execute(
+            conn,
+            "SELECT user_id, username FROM alkashi ORDER BY username",
+        )
+        return cur.fetchall()
+
+
 def reset_all_scores() -> None:
     with _connection() as conn:
         _execute(conn, "UPDATE alkashi SET score = 0")

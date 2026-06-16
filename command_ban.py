@@ -8,6 +8,8 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, TelegramOb
 
 from db import (
     ban_command,
+    ensure_user,
+    get_all_alkashi_users,
     is_chat_suicided,
     is_command_banned,
     list_banned_commands,
@@ -74,7 +76,7 @@ class SuicideVote:
     chat_id: int
     initiator_id: int
     initiator_name: str
-    required_count: int
+    required: dict[int, str] = field(default_factory=dict)
     agreed: set[int] = field(default_factory=set)
     declined: set[int] = field(default_factory=set)
     names: dict[int, str] = field(default_factory=dict)
@@ -202,17 +204,36 @@ def _cleanup_suicide_vote(vote: SuicideVote) -> None:
         _chat_suicide_vote.pop(vote.chat_id, None)
 
 
-def _suicide_required_yes(total: int) -> int:
+def _suicide_required_yes(vote: SuicideVote) -> int:
+    total = len(vote.required)
     return total // 2 + 1
 
 
 def _suicide_passed(vote: SuicideVote) -> bool:
-    return len(vote.agreed) >= _suicide_required_yes(vote.required_count)
+    return len(vote.agreed) >= _suicide_required_yes(vote)
 
 
 def _suicide_failed(vote: SuicideVote) -> bool:
-    need_yes = _suicide_required_yes(vote.required_count)
-    return len(vote.declined) > vote.required_count - need_yes
+    total = len(vote.required)
+    need_yes = _suicide_required_yes(vote)
+    return len(vote.declined) > total - need_yes
+
+
+async def _is_chat_member(bot: Bot, chat_id: int, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status not in ("left", "kicked")
+    except Exception:
+        return False
+
+
+async def _suicide_required_voters(bot: Bot, chat_id: int) -> dict[int, str]:
+    required: dict[int, str] = {}
+    for user_id, username in get_all_alkashi_users():
+        if not await _is_chat_member(bot, chat_id, user_id):
+            continue
+        required[user_id] = username or "Анон"
+    return required
 
 
 def _suicide_vote_keyboard(vote_id: str) -> InlineKeyboardMarkup:
@@ -227,18 +248,23 @@ def _suicide_vote_keyboard(vote_id: str) -> InlineKeyboardMarkup:
 
 
 def _suicide_vote_text(vote: SuicideVote) -> str:
-    need_yes = _suicide_required_yes(vote.required_count)
-    agreed_names = [vote.names[uid] for uid in vote.agreed if uid in vote.names]
-    declined_names = [vote.names[uid] for uid in vote.declined if uid in vote.names]
+    total = len(vote.required)
+    need_yes = _suicide_required_yes(vote)
+    agreed_names = [vote.required[uid] for uid in vote.agreed if uid in vote.required]
+    declined_names = [vote.required[uid] for uid in vote.declined if uid in vote.required]
+    pending = [
+        name for uid, name in vote.required.items()
+        if uid not in vote.agreed and uid not in vote.declined
+    ]
     lines = [
         "💀 <b>Голосование: /suicide</b>",
         "",
-        "Если <b>большинство</b> участников чата согласится — бот отключит "
-        "<b>все команды навсегда</b>. Восстановить нельзя.",
+        "Если <b>большинство</b> активных игроков бота согласится — "
+        "бот отключит <b>все команды навсегда</b>. Восстановить нельзя.",
         "",
         f"Инициатор: <b>{vote.initiator_name}</b>",
         f"✅ За: <b>{len(vote.agreed)}</b> | ❌ Против: <b>{len(vote.declined)}</b>",
-        f"Нужно: <b>{need_yes}</b> из <b>{vote.required_count}</b> голосов «За»",
+        f"Нужно: <b>{need_yes}</b> из <b>{total}</b> голосов «За»",
         "",
     ]
     if agreed_names:
@@ -248,6 +274,10 @@ def _suicide_vote_text(vote: SuicideVote) -> str:
     if declined_names:
         lines.append("❌ Против:")
         lines.extend(f"  • {name}" for name in declined_names)
+        lines.append("")
+    if pending:
+        lines.append("⏳ Ждём:")
+        lines.extend(f"  • {name}" for name in pending)
         lines.append("")
     return "\n".join(lines)
 
@@ -264,14 +294,6 @@ async def _finish_suicide_vote(bot: Bot, vote: SuicideVote, reason: str) -> None
     except Exception:
         pass
     _cleanup_suicide_vote(vote)
-
-
-async def _is_chat_member(bot: Bot, chat_id: int, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        return member.status not in ("left", "kicked")
-    except Exception:
-        return False
 
 
 class CommandBanMiddleware(BaseMiddleware):
@@ -335,7 +357,7 @@ def register_command_ban(dp: Dispatcher) -> None:
                 lines.append("Пока ничего не закрыто.")
             lines.append("\n<code>/ban steal</code> — голосование за закрытие")
             lines.append("<code>/unban steal</code> — голосование за открытие")
-            lines.append("<code>/suicide</code> — отключить все команды (если большинство согласно)")
+            lines.append("<code>/suicide</code> — отключить все команды (если большинство игроков бота согласно)")
             lines.append("\n<b>Можно закрыть:</b>")
             for cmd, label in BANNABLE_COMMANDS.items():
                 if cmd != "naruto_team":
@@ -563,28 +585,25 @@ def register_command_ban(dp: Dispatcher) -> None:
             await message.reply("⏳ Уже идёт другое голосование в этом чате.")
             return
 
-        try:
-            member_count = await message.bot.get_chat_member_count(chat_id)
-            me = await message.bot.get_me()
-            bot_member = await message.bot.get_chat_member(chat_id, me.id)
-            if bot_member.status not in ("left", "kicked"):
-                member_count = max(1, member_count - 1)
-        except Exception:
-            await message.reply("❌ Не удалось получить число участников чата.")
+        name = _user_name(user)
+        ensure_user(user.id, name)
+        required = await _suicide_required_voters(message.bot, chat_id)
+
+        if not required:
+            await message.reply("🍺 Нет активных игроков бота в этом чате.")
             return
 
-        if member_count < 1:
-            await message.reply("❌ В чате никого нет.")
+        if user.id not in required:
+            await message.reply("🚫 Голосовать могут только игроки бота, которые сейчас в чате.")
             return
 
         vote_id = uuid.uuid4().hex[:8]
-        name = _user_name(user)
         vote = SuicideVote(
             vote_id=vote_id,
             chat_id=chat_id,
             initiator_id=user.id,
             initiator_name=name,
-            required_count=member_count,
+            required=required,
             agreed={user.id},
             names={user.id: name},
             created_at=int(time.time()),
@@ -634,6 +653,10 @@ def register_command_ban(dp: Dispatcher) -> None:
 
         if not await _is_chat_member(callback.bot, vote.chat_id, user.id):
             await callback.answer("Ты не в этом чате", show_alert=True)
+            return
+
+        if user.id not in vote.required:
+            await callback.answer("Ты не в списке активных игроков бота", show_alert=True)
             return
 
         if user.id in vote.agreed:
