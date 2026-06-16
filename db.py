@@ -163,6 +163,16 @@ def _init_db() -> None:
                 )
                 """,
             )
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS chat_suicide (
+                    chat_id BIGINT PRIMARY KEY,
+                    activated_at BIGINT NOT NULL,
+                    activated_by TEXT NOT NULL DEFAULT ''
+                )
+                """,
+            )
         else:
             _execute(
                 conn,
@@ -268,6 +278,16 @@ def _init_db() -> None:
                     play_date TEXT NOT NULL,
                     count INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (user_id, game_key, play_date)
+                )
+                """,
+            )
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS chat_suicide (
+                    chat_id INTEGER PRIMARY KEY,
+                    activated_at INTEGER NOT NULL,
+                    activated_by TEXT NOT NULL DEFAULT ''
                 )
                 """,
             )
@@ -996,3 +1016,48 @@ def list_banned_commands(chat_id: int) -> list[tuple[str, str]]:
             (chat_id,),
         )
         return cur.fetchall()
+
+
+def is_chat_suicided(chat_id: int) -> bool:
+    with _connection() as conn:
+        cur = _execute(
+            conn,
+            "SELECT 1 FROM chat_suicide WHERE chat_id = ?",
+            (chat_id,),
+        )
+        return cur.fetchone() is not None
+
+
+def set_chat_suicide(chat_id: int, activated_by: str = "") -> None:
+    with _connection() as conn:
+        if _use_pg:
+            _execute(
+                conn,
+                """
+                INSERT INTO chat_suicide (chat_id, activated_at, activated_by)
+                VALUES (?, ?, ?)
+                ON CONFLICT (chat_id) DO UPDATE
+                SET activated_at = EXCLUDED.activated_at,
+                    activated_by = EXCLUDED.activated_by
+                """,
+                (chat_id, int(time.time()), activated_by),
+            )
+        else:
+            _execute(
+                conn,
+                """
+                INSERT OR REPLACE INTO chat_suicide (chat_id, activated_at, activated_by)
+                VALUES (?, ?, ?)
+                """,
+                (chat_id, int(time.time()), activated_by),
+            )
+
+
+def clear_chat_suicide(chat_id: int) -> bool:
+    with _connection() as conn:
+        cur = _execute(
+            conn,
+            "DELETE FROM chat_suicide WHERE chat_id = ?",
+            (chat_id,),
+        )
+        return cur.rowcount > 0

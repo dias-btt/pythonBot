@@ -6,12 +6,20 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandObject
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, TelegramObject
 
-from db import ban_command, is_command_banned, list_banned_commands, unban_command
+from db import (
+    ban_command,
+    is_chat_suicided,
+    is_command_banned,
+    list_banned_commands,
+    set_chat_suicide,
+    unban_command,
+)
 
 VOTE_TTL = 30 * 60
+SUICIDE_VOTE_TTL = 60 * 60
 MIN_YES_VOTES = 3
 
-PROTECTED_COMMANDS = {"ban", "unban", "bans", "info", "start"}
+PROTECTED_COMMANDS = {"info", "start"}
 
 BANNABLE_COMMANDS = {
     "steal": "🦹 Кража баллов",
@@ -58,6 +66,24 @@ class CommandBanVote:
 
 _votes: dict[str, CommandBanVote] = {}
 _chat_vote: dict[int, str] = {}
+
+
+@dataclass
+class SuicideVote:
+    vote_id: str
+    chat_id: int
+    initiator_id: int
+    initiator_name: str
+    required_count: int
+    agreed: set[int] = field(default_factory=set)
+    declined: set[int] = field(default_factory=set)
+    names: dict[int, str] = field(default_factory=dict)
+    message_id: int = 0
+    created_at: int = 0
+
+
+_suicide_votes: dict[str, SuicideVote] = {}
+_chat_suicide_vote: dict[int, str] = {}
 
 
 def _user_name(user: types.User) -> str:
@@ -157,6 +183,97 @@ async def _finish_vote(bot: Bot, vote: CommandBanVote, success: bool, reason: st
     _cleanup_vote(vote)
 
 
+def _active_suicide_vote(chat_id: int) -> SuicideVote | None:
+    vote_id = _chat_suicide_vote.get(chat_id)
+    if not vote_id:
+        return None
+    vote = _suicide_votes.get(vote_id)
+    if not vote:
+        return None
+    if time.time() - vote.created_at > SUICIDE_VOTE_TTL:
+        _cleanup_suicide_vote(vote)
+        return None
+    return vote
+
+
+def _cleanup_suicide_vote(vote: SuicideVote) -> None:
+    _suicide_votes.pop(vote.vote_id, None)
+    if _chat_suicide_vote.get(vote.chat_id) == vote.vote_id:
+        _chat_suicide_vote.pop(vote.chat_id, None)
+
+
+def _suicide_required_yes(total: int) -> int:
+    return total // 2 + 1
+
+
+def _suicide_passed(vote: SuicideVote) -> bool:
+    return len(vote.agreed) >= _suicide_required_yes(vote.required_count)
+
+
+def _suicide_failed(vote: SuicideVote) -> bool:
+    need_yes = _suicide_required_yes(vote.required_count)
+    return len(vote.declined) > vote.required_count - need_yes
+
+
+def _suicide_vote_keyboard(vote_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Согласен", callback_data=f"sui:yes:{vote_id}"),
+                InlineKeyboardButton(text="❌ Против", callback_data=f"sui:no:{vote_id}"),
+            ]
+        ]
+    )
+
+
+def _suicide_vote_text(vote: SuicideVote) -> str:
+    need_yes = _suicide_required_yes(vote.required_count)
+    agreed_names = [vote.names[uid] for uid in vote.agreed if uid in vote.names]
+    declined_names = [vote.names[uid] for uid in vote.declined if uid in vote.names]
+    lines = [
+        "💀 <b>Голосование: /suicide</b>",
+        "",
+        "Если <b>большинство</b> участников чата согласится — бот отключит "
+        "<b>все команды навсегда</b>. Восстановить нельзя.",
+        "",
+        f"Инициатор: <b>{vote.initiator_name}</b>",
+        f"✅ За: <b>{len(vote.agreed)}</b> | ❌ Против: <b>{len(vote.declined)}</b>",
+        f"Нужно: <b>{need_yes}</b> из <b>{vote.required_count}</b> голосов «За»",
+        "",
+    ]
+    if agreed_names:
+        lines.append("✅ За:")
+        lines.extend(f"  • {name}" for name in agreed_names)
+        lines.append("")
+    if declined_names:
+        lines.append("❌ Против:")
+        lines.extend(f"  • {name}" for name in declined_names)
+        lines.append("")
+    return "\n".join(lines)
+
+
+async def _finish_suicide_vote(bot: Bot, vote: SuicideVote, reason: str) -> None:
+    text = _suicide_vote_text(vote) + f"\n\n{reason}"
+    try:
+        await bot.edit_message_text(
+            text,
+            chat_id=vote.chat_id,
+            message_id=vote.message_id,
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+    _cleanup_suicide_vote(vote)
+
+
+async def _is_chat_member(bot: Bot, chat_id: int, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status not in ("left", "kicked")
+    except Exception:
+        return False
+
+
 class CommandBanMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: TelegramObject, data: dict):
         if not isinstance(event, types.Message):
@@ -172,6 +289,12 @@ class CommandBanMiddleware(BaseMiddleware):
         cmd = _parse_command_name(text)
         if not cmd or cmd in PROTECTED_COMMANDS:
             return await handler(event, data)
+
+        if is_chat_suicided(event.chat.id):
+            await event.reply(
+                "💀 Бот «умер» по согласию большинства. Команды отключены навсегда."
+            )
+            return
 
         if is_command_banned(event.chat.id, cmd):
             await event.reply(
@@ -201,7 +324,9 @@ def register_command_ban(dp: Dispatcher) -> None:
         if not args or args in ("help", "?", "помощь", "list", "список"):
             banned = list_banned_commands(message.chat.id)
             lines = ["🗳️ <b>БАН КОМАНД</b>\n"]
-            if banned:
+            if is_chat_suicided(message.chat.id):
+                lines.append("💀 Бот «мёртв» — команды отключены навсегда.")
+            elif banned:
                 lines.append("<b>Закрыто в этом чате:</b>")
                 for cmd, by in banned:
                     label = BANNABLE_COMMANDS.get(cmd, cmd)
@@ -210,11 +335,16 @@ def register_command_ban(dp: Dispatcher) -> None:
                 lines.append("Пока ничего не закрыто.")
             lines.append("\n<code>/ban steal</code> — голосование за закрытие")
             lines.append("<code>/unban steal</code> — голосование за открытие")
+            lines.append("<code>/suicide</code> — отключить все команды (если большинство согласно)")
             lines.append("\n<b>Можно закрыть:</b>")
             for cmd, label in BANNABLE_COMMANDS.items():
                 if cmd != "naruto_team":
                     lines.append(f"  /{cmd} — {label}")
             await message.reply("\n".join(lines))
+            return
+
+        if is_chat_suicided(message.chat.id):
+            await message.reply("💀 Бот «мёртв» — команды отключены навсегда.")
             return
 
         cmd = _normalize_cmd(args.split()[0])
@@ -231,6 +361,10 @@ def register_command_ban(dp: Dispatcher) -> None:
         active = _active_vote(message.chat.id)
         if active:
             await message.reply("⏳ Уже идёт голосование в этом чате. Жми кнопки там.")
+            return
+
+        if _active_suicide_vote(message.chat.id):
+            await message.reply("⏳ Уже идёт голосование за /suicide.")
             return
 
         vote_id = uuid.uuid4().hex[:8]
@@ -269,6 +403,10 @@ def register_command_ban(dp: Dispatcher) -> None:
             await message.reply("Укажи команду: <code>/unban steal</code>")
             return
 
+        if is_chat_suicided(message.chat.id):
+            await message.reply("💀 Бот «мёртв» — команды отключены навсегда.")
+            return
+
         cmd = _normalize_cmd(args.split()[0])
         if not cmd:
             await message.reply("❓ Неизвестная команда. Список: <code>/ban list</code>")
@@ -281,6 +419,10 @@ def register_command_ban(dp: Dispatcher) -> None:
         active = _active_vote(message.chat.id)
         if active:
             await message.reply("⏳ Уже идёт голосование в этом чате. Жми кнопки там.")
+            return
+
+        if _active_suicide_vote(message.chat.id):
+            await message.reply("⏳ Уже идёт голосование за /suicide.")
             return
 
         vote_id = uuid.uuid4().hex[:8]
@@ -393,6 +535,148 @@ def register_command_ban(dp: Dispatcher) -> None:
                 await callback.message.edit_text(
                     _vote_text(vote),
                     reply_markup=_vote_keyboard(vote.vote_id),
+                )
+            except Exception:
+                pass
+
+    @dp.message(Command("suicide"))
+    async def suicide_cmd(message: types.Message):
+        if message.chat.type not in ("group", "supergroup"):
+            await message.reply("🗳️ Голосование работает только в группе!")
+            return
+
+        user = message.from_user
+        if not user:
+            return
+
+        chat_id = message.chat.id
+
+        if is_chat_suicided(chat_id):
+            await message.reply("💀 Бот уже «мёртв» в этом чате. Восстановить нельзя.")
+            return
+
+        if _active_suicide_vote(chat_id):
+            await message.reply("⏳ Уже идёт голосование за /suicide. Жми кнопки там.")
+            return
+
+        if _active_vote(chat_id):
+            await message.reply("⏳ Уже идёт другое голосование в этом чате.")
+            return
+
+        try:
+            member_count = await message.bot.get_chat_member_count(chat_id)
+            me = await message.bot.get_me()
+            bot_member = await message.bot.get_chat_member(chat_id, me.id)
+            if bot_member.status not in ("left", "kicked"):
+                member_count = max(1, member_count - 1)
+        except Exception:
+            await message.reply("❌ Не удалось получить число участников чата.")
+            return
+
+        if member_count < 1:
+            await message.reply("❌ В чате никого нет.")
+            return
+
+        vote_id = uuid.uuid4().hex[:8]
+        name = _user_name(user)
+        vote = SuicideVote(
+            vote_id=vote_id,
+            chat_id=chat_id,
+            initiator_id=user.id,
+            initiator_name=name,
+            required_count=member_count,
+            agreed={user.id},
+            names={user.id: name},
+            created_at=int(time.time()),
+        )
+        _suicide_votes[vote_id] = vote
+        _chat_suicide_vote[chat_id] = vote_id
+
+        if _suicide_passed(vote):
+            set_chat_suicide(chat_id, name)
+            _cleanup_suicide_vote(vote)
+            await message.reply(
+                "💀 Большинство уже за — бот «умер». Все команды отключены навсегда."
+            )
+            return
+
+        sent = await message.reply(
+            _suicide_vote_text(vote),
+            reply_markup=_suicide_vote_keyboard(vote_id),
+        )
+        vote.message_id = sent.message_id
+
+    @dp.callback_query(F.data.startswith("sui:"))
+    async def suicide_vote_callback(callback: types.CallbackQuery):
+        parts = callback.data.split(":")
+        if len(parts) != 3:
+            await callback.answer("Ошибка данных", show_alert=True)
+            return
+
+        _, action, vote_id = parts
+        vote = _suicide_votes.get(vote_id)
+        if not vote:
+            await callback.answer("Голосование уже неактуально", show_alert=True)
+            return
+
+        if time.time() - vote.created_at > SUICIDE_VOTE_TTL:
+            await _finish_suicide_vote(
+                callback.bot,
+                vote,
+                "⏰ Время вышло — голосование отменено.",
+            )
+            await callback.answer("Время вышло", show_alert=True)
+            return
+
+        user = callback.from_user
+        if not user:
+            return
+
+        if not await _is_chat_member(callback.bot, vote.chat_id, user.id):
+            await callback.answer("Ты не в этом чате", show_alert=True)
+            return
+
+        if user.id in vote.agreed:
+            await callback.answer("Ты уже согласился")
+            return
+        if user.id in vote.declined:
+            await callback.answer("Ты уже проголосовал против")
+            return
+
+        name = _user_name(user)
+
+        if action == "no":
+            vote.declined.add(user.id)
+            vote.names[user.id] = name
+            await callback.answer("Ты проголосовал против")
+            if _suicide_failed(vote):
+                await _finish_suicide_vote(
+                    callback.bot,
+                    vote,
+                    "❌ Голосование провалено — большинство против.",
+                )
+                return
+        elif action == "yes":
+            vote.agreed.add(user.id)
+            vote.names[user.id] = name
+            await callback.answer("Ты согласился")
+            if _suicide_passed(vote):
+                set_chat_suicide(vote.chat_id, vote.initiator_name)
+                await _finish_suicide_vote(
+                    callback.bot,
+                    vote,
+                    "💀 <b>Большинство согласно!</b> Команды бота в этом чате отключены навсегда.",
+                )
+                return
+        else:
+            await callback.answer("Неизвестное действие", show_alert=True)
+            return
+
+        if callback.message:
+            try:
+                await callback.message.edit_text(
+                    _suicide_vote_text(vote),
+                    reply_markup=_suicide_vote_keyboard(vote.vote_id),
                 )
             except Exception:
                 pass
